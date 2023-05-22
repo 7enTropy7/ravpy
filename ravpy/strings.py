@@ -177,6 +177,7 @@ class Operators(object):
     #Pytorch model
     PYTORCH_MODEL = "pytorch_model"
     FORWARD_PASS = "forward_pass"
+    MODEL_OUTPUT = "model_output"
 
 
 class TFJSOperators(object):
@@ -340,7 +341,8 @@ functions = {'lin': Operators.LINEAR,
 
              #Pytorch model
              'pytorch_model': Operators.PYTORCH_MODEL,
-             'forward_pass': Operators.FORWARD_PASS
+             'forward_pass': Operators.FORWARD_PASS,
+             'model_output': Operators.MODEL_OUTPUT,
              }
 
 

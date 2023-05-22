@@ -82,14 +82,14 @@ async def benchmark_model(seed, graph_id=None):
     benchmark_data = {
         'benchmark_data': benchmark_result,
         'graph_id': graph_id,
-        'upload_speed': 10000000000000000,#g.upload_speed,
-        'download_speed': 10000000000000000,#g.download_speed,
+        'upload_speed': g.upload_speed,
+        'download_speed': g.download_speed,
         'total_RAM': get_total_RAM(),
         'total_VRAM': total_VRAM,
         'gpu_available': check_gpu(),
         'client_sid': g.client.get_sid(namespace='/client')
     }
-    print("\n\ntotal_RAM: ", benchmark_data['total_RAM'], "total_VRAM: ", benchmark_data['total_VRAM'])
+
     g.logger.debug("Emitting Benchmarking Data: {}".format(benchmark_data))
     await g.client.emit("benchmark_callback", data=json.dumps(benchmark_data), namespace="/comm")
     await g.client.sleep(1)

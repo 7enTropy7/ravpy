@@ -12,143 +12,256 @@ from ..utils import get_key, load_data, load_data_raw
 from .op_functions import *
 
 # async
-def compute_locally(payload, subgraph_id, graph_id, forward_computations, to_upload=False, gpu_required=False):
-    try:
-        values = []
-        for i in range(len(payload["values"])):
-            if "value" in payload["values"][i].keys():
-                if "path" not in payload["values"][i].keys():
-                    values.append(torch.tensor(payload["values"][i]["value"]))
+def compute_locally(payload, subgraph_id, graph_id, retain=False, to_upload=False, gpu_required=False):
+    # try:
+    values = []
+    input_indices = {}
+    print('\n Payload values: ', payload['values'])
+    for i in range(len(payload["values"])):
+        if "value" in payload["values"][i].keys():
+            if "path" not in payload["values"][i].keys():
+                values.append(torch.tensor(payload["values"][i]["value"]))
 
-                else:
-                    download_path = os.path.join(FTP_DOWNLOAD_FILES_FOLDER,
-                                                    os.path.basename(payload["values"][i]["path"]))
-                    value = load_data_raw(download_path)
-
-                    if isinstance(value, dict):
-                        value = value['result']
-
-                    if isinstance(value, list) or isinstance(value, np.ndarray):
-                        value = torch.tensor(value)
-
-                    values.append(value)
-                    del value
-
-            elif "op_id" in payload["values"][i].keys():
-                values.append(forward_computations[payload['values'][i]['op_id']])
-
-        payload["values"] = values
-
-        op_type = payload["op_type"]
-        operator = get_key(payload["operator"], functions)
-        params = payload['params']
-        instance = payload.get('instance', None)
-        optimizer = None
-
-        if instance is not None:
-            download_path = os.path.join(FTP_DOWNLOAD_FILES_FOLDER, os.path.basename(instance))
-            instance_dict = load_data_raw(download_path)
-            instance = instance_dict.get('instance', None)
-            optimizer = instance_dict.get('optimizer', None)
-            del instance_dict
-
-        params['instance'] = instance
-        params['optimizer'] = optimizer
-
-        params_dict = {}
-
-        device = 'cpu'
-        if gpu_required:
-            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        params_dict["device"] = device
-
-        for i in params.keys():
-            if i == "previous_forward_pass":
-                if 'op_id' in params[i].keys():
-                    params_dict[i] = forward_computations[params[i]['op_id']]
-                elif 'value' in params[i].keys():
-
-                    download_path = os.path.join(FTP_DOWNLOAD_FILES_FOLDER,
-                                                        os.path.basename(params[i]['path']))
-                    previous_instance = load_data_raw(download_path)
-                    params_dict['previous_batch_layer_data'] = previous_instance
-
-                    if payload['operator'] == "forward_pass" and 'model_path' in params[i].keys():
-                        model_download_path = os.path.join(FTP_DOWNLOAD_FILES_FOLDER,
-                                                        os.path.basename(params[i]['model_path']))
-                        params_dict['model_jit'] = torch.jit.load(model_download_path, map_location=device, _restore_shapes=True)
-        
-                continue
-
-            if i == "model":
+            else:
                 download_path = os.path.join(FTP_DOWNLOAD_FILES_FOLDER,
-                                                    os.path.basename(params[i]["path"]))
-                params_dict[i] = torch.jit.load(download_path, map_location=device, _restore_shapes=True)
-                continue
+                                                os.path.basename(payload["values"][i]["path"]))
+                value = load_data_raw(download_path)
 
-            if type(params[i]) == str:
-                try:
-                    temp = ast.literal_eval(params[i])
-                    if type(temp) == dict or type(temp) == bool:
-                        params_dict[i] = temp
-                except:
-                    params_dict[i] = params[i]
-            elif type(params[i]) == dict:
-                if 'op_id' in params[i].keys():
-                    op_id = params[i]["op_id"]
-                    param_value = forward_computations[op_id].numpy().tolist()
-                elif 'value' in params[i].keys():
-                    download_path = os.path.join(FTP_DOWNLOAD_FILES_FOLDER,
-                                                    os.path.basename(params[i]["path"]))
-                    param_value = load_data(download_path).tolist()
+                if isinstance(value, dict):
+                    value = value['result']
+
+                if isinstance(value, list) or isinstance(value, np.ndarray):
+                    value = torch.tensor(value)
+
+                index_flag = False
+                print('\n Input value: ', value)
+                if payload['operator'] == 'forward_pass':
+                    input_index_list = []
+                    for param_key, param_value in payload['params'].items():
+                        if 'index_' in param_key:
+                            print('\n Param key and val in inputs loop: ', param_key, param_value, type(param_value['op_id']), type(payload['values'][i]['value']))
+                            if param_value['op_id'] == payload['values'][i]['value']:
+                                values.append(value[int(param_key.split('_')[-1])])
+                                input_index_list.append(param_key)
+
+                                index_flag = True
+                    input_indices[payload['values'][i]['value']] = input_index_list
+
+                elif payload['operator'] == 'model_output':
+                    for param_key, param_value in payload['params'].items():
+                        if 'index_' in param_key:
+                            print('\n Param key and val in inputs loop of model_output: ', param_key, param_value, type(param_value['op_id']), type(payload['values'][i]['value']))
+                            if param_value['op_id'] == payload['values'][i]['value']:
+                                print('\n Value in model_output: ', value, type(value))
+                                if isinstance(value[int(param_key.split('_')[-1])], dict):
+                                    values.append(value[int(param_key.split('_')[-1])]['result'])
+                                else:
+                                    values.append(value[int(param_key.split('_')[-1])])
+                                index_flag = True
+
+                if not index_flag:
+                    if isinstance(value, dict):
+                        values.append(value['result'])
+                    else:
+                        values.append(value)
+                del value
+
+        elif "op_id" in payload["values"][i].keys():
+            index_flag = False
+            if payload['operator'] == 'model_output':
+                for param_key, param_value in payload['params'].items():
+                    if 'index_' in param_key:
+                        if param_value['op_id'] == payload['values'][i]['op_id']:
+                            value = g.forward_computations[payload['values'][i]['op_id']]
+                            if isinstance(value, dict):
+                                value = value['result']
+
+                            if isinstance(value, list) or isinstance(value, np.ndarray):
+                                value = torch.tensor(value)
+                            
+                            if isinstance(value[int(param_key.split('_')[-1])], dict):
+                                values.append(value[int(param_key.split('_')[-1])]['result'])
+                            else:
+                                values.append(value[int(param_key.split('_')[-1])])
+                            index_flag = True
+                            del value
+
+            if not index_flag:
+                if isinstance(g.forward_computations[payload['values'][i]['op_id']], dict):
+                    values.append(g.forward_computations[payload['values'][i]['op_id']]['result'])
+                else:
+                    values.append(g.forward_computations[payload['values'][i]['op_id']])
+
+    # payload["values"] = values
+
+    # print("\n Input values for Op: ", values)
+
+    op_type = payload["op_type"]
+    operator = get_key(payload["operator"], functions)
+    params = payload['params']
+    instance = payload.get('instance', None)
+    optimizer = None
+
+    if instance is not None:
+        download_path = os.path.join(FTP_DOWNLOAD_FILES_FOLDER, os.path.basename(instance))
+        instance_dict = load_data_raw(download_path)
+        instance = instance_dict.get('instance', None)
+        optimizer = instance_dict.get('optimizer', None)
+        del instance_dict
+
+    params['instance'] = instance
+    params['optimizer'] = optimizer
+
+    params_dict = {}
+
+    device = 'cpu'
+    if gpu_required:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    params_dict["device"] = device
+    params_dict["retain"] = retain
+    params_dict["input_indices"] = input_indices
+
+    local_previous_instance = None
+
+    for i in params.keys():
+        if i == "previous_forward_pass":
+            if 'op_id' in params[i].keys():
+                print('\n g.forward_comp in prev_forward_pass: ', g.forward_computations, type(params[i]['op_id']))
+                params_dict[i] = g.forward_computations[params[i]['op_id']]
+                local_previous_instance = params[i]['op_id']
+            elif 'value' in params[i].keys():
+
+                download_path = os.path.join(FTP_DOWNLOAD_FILES_FOLDER,
+                                                    os.path.basename(params[i]['path']))
+                previous_instance = load_data_raw(download_path)
+                params_dict['previous_batch_layer_data'] = previous_instance
+
+                if payload['operator'] == "forward_pass" and 'model_path' in params[i].keys():
+                    model_download_path = os.path.join(FTP_DOWNLOAD_FILES_FOLDER,
+                                                    os.path.basename(params[i]['model_path']))
+                    params_dict['model_jit'] = torch.jit.load(model_download_path, map_location=device)
+    
+            continue
+
+        if i == "model":
+            download_path = os.path.join(FTP_DOWNLOAD_FILES_FOLDER,
+                                                os.path.basename(params[i]["path"]))
+            params_dict[i] = torch.jit.load(download_path, map_location=device)
+            continue
+        
+        if 'index_' in i:
+            continue
+
+        if type(params[i]) == str:
+            try:
+                temp = ast.literal_eval(params[i])
+                if type(temp) == dict or type(temp) == bool:
+                    params_dict[i] = temp
+            except:
+                params_dict[i] = params[i]
+        elif type(params[i]) == dict:
+            if 'op_id' in params[i].keys():
+                op_id = params[i]["op_id"]
+                param_value = g.forward_computations[op_id].numpy().tolist()
+            elif 'value' in params[i].keys():
+                download_path = os.path.join(FTP_DOWNLOAD_FILES_FOLDER,
+                                                os.path.basename(params[i]["path"]))
+                param_value = load_data(download_path).tolist()
+            
+            params_dict[i] = param_value
+            del param_value
+
+    if operator == 'forward_pass':
+        vals = values #payload['values']
+        result = forward_pass(*vals, params=params_dict)
+
+    elif operator == 'model_output':
+        vals = values #payload['values']
+        result = model_output(*vals, params=params_dict)
+
+    elif op_type == "unary":
+        val_1 = values[0] #payload["values"][0]
+        result = get_unary_result(val_1, params_dict, operator)
+        del val_1
+
+    elif op_type == "binary":
+        val_1 = values[0] #payload["values"][0]
+        val_2 = values[1] #payload["values"][1]
+        result = get_binary_result(val_1, val_2, params_dict, operator)
+        del val_1
+        del val_2
+
+    g.forward_computations[payload['op_id']] = result
+    if local_previous_instance is not None:
+        del g.forward_computations[local_previous_instance]
+
+
+    del params_dict
+    del params
+    del result
+    del values
+    del instance
+    del optimizer
+
+    if gpu_required:
+        torch.cuda.empty_cache()
+
+    if not to_upload:
+        return json.dumps({
+            'op_type': payload["op_type"],
+            'operator': payload["operator"],
+            "op_id": payload["op_id"],
+            "status": "success"
+        })
+    else:
+        return None
+
+    # except Exception as error:
+    #     os.system('clear')
+    #     g.dashboard_data[-1][2] = "Failed"
+    #     print(AsciiTable([['Provider Dashboard']]).table)
+    #     print(AsciiTable(g.dashboard_data).table)
+    #     emit_error(payload, error, subgraph_id, graph_id)
+    #     if 'broken pipe' in str(error).lower() or '421' in str(error).lower():
+    #         print('\n\nYou have encountered an IO based Broken Pipe Error. \nRestart terminal and try connecting again')
+    #         sys.exit()
+
+
+def compute_backward(payload):
+    print('\n Payload values: ', payload['values'])
+    for i in range(len(payload["values"])):
+        if "value" in payload["values"][i].keys():
+            if "path" not in payload["values"][i].keys():
+                grad = torch.tensor(payload["values"][i]["value"])
+
+            else:
+                download_path = os.path.join(FTP_DOWNLOAD_FILES_FOLDER,
+                                                os.path.basename(payload["values"][i]["path"]))
+                value = load_data_raw(download_path)[payload['op_id']]
+
+                if isinstance(value, list) or isinstance(value, np.ndarray):
+                    value = torch.tensor(value)
+
+                # print('\n Input value: ', value)
                 
-                params_dict[i] = param_value
-                del param_value
+                forward_computation = g.forward_computations[payload['op_id']]
+                # print('\n Forward computation in backward: ', forward_computation)
+                if isinstance(value, dict):
+                    for key, val in value.items():
+                        if 'index_' in key:
+                            index_id = int(key.split('_')[-1])
+                            forward_computation['result'][index_id].backward(val, retain_graph=True)
+                            print('\n Backward done')
+                
+                elif isinstance(value, torch.Tensor):
+                    forward_computation['result'].backward(value, retain_graph=True)
+                    print('\n Backward done')
 
-        if op_type == "unary":
-            val_1 = payload["values"][0]
-            result = get_unary_result(val_1, params_dict, operator)
-            del val_1
+    g.forward_computations[payload['op_id']]['optimizer'].step()
+    g.forward_computations[payload['op_id']]['optimizer'].zero_grad()
+    print('\n Step and zero grad called')
 
-        elif op_type == "binary":
-            val_1 = payload["values"][0]
-            val_2 = payload["values"][1]
-            result = get_binary_result(val_1, val_2, params_dict, operator)
-            del val_1
-            del val_2
-
-        forward_computations[payload['op_id']] = result
-
-        del params_dict
-        del params
-        del result
-        del values
-        del instance
-        del optimizer
-
-        if gpu_required:
-            torch.cuda.empty_cache()
-
-        if not to_upload:
-            return json.dumps({
-                'op_type': payload["op_type"],
-                'operator': payload["operator"],
-                "op_id": payload["op_id"],
-                "status": "success"
-            }), forward_computations
-        else:
-            return None, forward_computations
-
-    except Exception as error:
-        os.system('clear')
-        g.dashboard_data[-1][2] = "Failed"
-        print(AsciiTable([['Provider Dashboard']]).table)
-        print(AsciiTable(g.dashboard_data).table)
-        emit_error(payload, error, subgraph_id, graph_id)
-        if 'broken pipe' in str(error).lower() or '421' in str(error).lower():
-            print('\n\nYou have encountered an IO based Broken Pipe Error. \nRestart terminal and try connecting again')
-            sys.exit()
-
+    
 
 def  get_unary_result(value1, params, operator):
     if operator == "neg":

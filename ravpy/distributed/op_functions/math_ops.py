@@ -61,6 +61,11 @@ def np_min(value1, params=None):
     return np.min(value1, axis=axis, keepdims=keepdims)
 
 def np_argmax(value1, params=None):
+    op_index = params.get('op_index',0)
+
+    if isinstance(value1, tuple):
+        value1 = value1[op_index]
+
     if isinstance(value1, dict):
         value1 = value1['result']
     if isinstance(value1, list) or isinstance(value1, np.ndarray):
@@ -453,6 +458,13 @@ def mode(arr,params=None):#axis=0):
 
 def concatenate(a,b,params=None):
     axis = params.get('axis', 0)
+    op_index = params.get('op_index', 0)
+
+    if isinstance(a, tuple):
+        a = a[op_index]
+
+    if isinstance(b, tuple):
+        b = b[op_index]
 
     if isinstance(a, dict):
         a = a['result']
@@ -499,6 +511,10 @@ def repeat(arr,params=None):#repeats=None, axis=None):
 
 def index(arr,params=None):#indices=None):
     indices = params.get('indices', None)
+    op_index = params.get('op_index', 0)
+
+    if isinstance(arr, tuple):
+        arr = arr[op_index]
 
     if isinstance(arr, dict):
         arr = arr['result']

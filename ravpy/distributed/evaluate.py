@@ -6,7 +6,7 @@ import ast
 import pickle as pkl
 from terminaltables import AsciiTable
 import zipfile
-from .compute import compute_locally, emit_error
+from .compute import compute_locally, compute_backward, emit_error
 from ..config import FTP_DOWNLOAD_FILES_FOLDER, FTP_TEMP_FILES_FOLDER
 from ..globals import g
 from ..utils import setTimeout, stopTimer, dump_data, dump_torch_model, dump_result_data
@@ -30,20 +30,29 @@ def get_gpu_memory():
 
 @g.client.on('subgraph_forward', namespace="/client")
 async def compute_subgraph_forward(d):
-    g.param_queue['param'] = d
+    g.param_queue['forward_param'] = d
+
+@g.client.on('subgraph_backward', namespace="/client")
+async def compute_subgraph_backward(d):
+    g.param_queue['backward_param'] = d
 
 async def compute_thread():
     while True:
-        if g.param_queue.get('param',None) is not None:
-            await subgraph_forward_process(g.param_queue['param'])
-            del g.param_queue['param']
+        if g.param_queue.get('forward_param',None) is not None:
+            await subgraph_forward_process(g.param_queue['forward_param'])
+            del g.param_queue['forward_param']
+
+        if g.param_queue.get('backward_param',None) is not None:
+            await subgraph_backward_process(g.param_queue['backward_param'])
+            del g.param_queue['backward_param']
+        
         time.sleep(1.5)
 
 async def subgraph_forward_process(d):
-    global timeoutId
     gc.collect()
     total_t = time.time()
-    os.system('clear')
+    g.logger.debug('subgraph_forward_process received')
+    # os.system('clear')
     print(AsciiTable([['Provider Dashboard']]).table)
     g.dashboard_data.append([d["subgraph_id"], d["graph_id"], "Computing"])
     print(AsciiTable(g.dashboard_data).table)
@@ -52,16 +61,18 @@ async def subgraph_forward_process(d):
     subgraph_id = d["subgraph_id"]
     graph_id = d["graph_id"]
     data = d["payloads"]
+    # print("\n Data before computation: ", data)
     gpu_required = ast.literal_eval(d["gpu_required"])
 
     subgraph_outputs = d["subgraph_outputs_list"]
     persist_forward_pass_results_list = d["persist_forward_pass_results"]
-    persist_model_list = d["persist_model_list"]
 
     subgraph_zip_file_flag = d["subgraph_zip_file_flag"]
     results = []
+    del_keys = []
+    backward_called = False
     g.error = False
-    forward_computations = {}
+    # g.forward_computations = {}
 
     if subgraph_zip_file_flag == "True":
         server_file_path = 'zip_{}_{}.zip'.format(subgraph_id, graph_id)
@@ -113,32 +124,35 @@ async def subgraph_forward_process(d):
             step = ast.literal_eval(marker_params.get("step", "True"))
             for input_value in index["values"]:
                 if "op_id" in input_value:
-                    forward_computations[input_value['op_id']].backward()
+                    print("\n Backward Called")
+                    g.forward_computations[input_value['op_id']].backward()
+                    backward_called = True
                     if input_value['op_id'] in subgraph_outputs:
-                        detached_loss = forward_computations[input_value['op_id']].detach()
-                        forward_computations[input_value['op_id']] = detached_loss
+                        detached_loss = g.forward_computations[input_value['op_id']].detach()
+                        g.forward_computations[input_value['op_id']] = detached_loss
                     else:
-                        del forward_computations[input_value['op_id']]
+                        del g.forward_computations[input_value['op_id']]
 
-            for key in forward_computations.keys():
-                if isinstance(forward_computations[key], dict):
-                    if forward_computations[key].get('result', None) is not None:
+            # for key in g.forward_computations.keys():
+            #     if isinstance(g.forward_computations[key], dict):
+            #         if g.forward_computations[key].get('result', None) is not None:
                         
-                        # del g.forward_computations[key]['result']
-                        if key in persist_forward_pass_results_list:
-                            forward_computations[key]['result'] = forward_computations[key]['result'].detach()
-                        else:
-                            forward_computations[key]['result'] = forward_computations[key]['result'].detach()
-                            forward_computations[key]['result'] = None
+            #             # del g.forward_computations[key]['result']
+            #             if key in persist_forward_pass_results_list:
+            #                 g.forward_computations[key]['result'] = g.forward_computations[key]['result'].detach()
+            #             else:
+            #                 g.forward_computations[key]['result'] = g.forward_computations[key]['result'].detach()
+            #                 g.forward_computations[key]['result'] = None
 
             if step:
-                for key in forward_computations.keys():
+                for key in g.forward_computations.keys():
                     # op_result = g.forward_computations[key]
-                    if isinstance(forward_computations[key], dict):
+                    if isinstance(g.forward_computations[key], dict):
                         # op_optimizer = g.forward_computations[key].get('optimizer', None)
-                        if forward_computations[key].get('optimizer', None) is not None:                            
-                            forward_computations[key]['optimizer'].step()
-                            forward_computations[key]['optimizer'].zero_grad()
+                        if g.forward_computations[key].get('optimizer', None) is not None:                            
+                            print("\n Step called")
+                            g.forward_computations[key]['optimizer'].step()
+                            g.forward_computations[key]['optimizer'].zero_grad()
 
                             # g.forward_computations[key]['optimizer'] = op_optimizer
 
@@ -150,7 +164,7 @@ async def subgraph_forward_process(d):
             continue
 
         if operation_type is not None and operator is not None:
-            result_payload, forward_computations = compute_locally(payload=index, subgraph_id=subgraph_id, graph_id=graph_id, forward_computations=forward_computations, to_upload=to_upload, gpu_required = gpu_required)
+            result_payload = compute_locally(payload=index, subgraph_id=subgraph_id, graph_id=graph_id, retain = index['retain'], to_upload=to_upload, gpu_required = gpu_required)
             if not g.error:
                 if result_payload is not None:
                     results.append(result_payload)
@@ -167,51 +181,78 @@ async def subgraph_forward_process(d):
                 to_upload = True
             else:
                 to_upload = False
+            
+            if not index.get('retain', False):
+                del_keys.append(index['op_id'])
+
             if to_upload:
                 results_dict = {}
-                previous_instance_dict = index['params'].get('previous_forward_pass', None)
-                if previous_instance_dict is not None and 'op_id' in previous_instance_dict.keys():
-                    previous_instance_id = previous_instance_dict['op_id']
-                    if forward_computations[previous_instance_id].get('instance', None) is not None:
-                        results_dict['instance'] = forward_computations[previous_instance_id]['instance']
-                    if forward_computations[previous_instance_id].get('optimizer', None) is not None:
-                        results_dict['optimizer'] = forward_computations[previous_instance_id]['optimizer']
 
-                    results_dict['result'] = forward_computations[index['op_id']]['result']
+                if index['operator'] == 'forward_pass' and not backward_called:
+                    results_dict['result'] = g.forward_computations[index['op_id']]['result']
 
-                else:
-                    results_dict = forward_computations[index['op_id']]
-
-                persisted_result_path = None
-
-                if index['operator'] == 'forward_pass':
-                    if index['op_id'] in persist_model_list:
-                        model_path = dump_torch_model(index['op_id'], results_dict['instance'].to('cpu'))
-                    else:
-                        model_path = dump_torch_model(index['op_id'], results_dict['instance'])
-                    del results_dict['instance']
-                    if index['op_id'] not in persist_forward_pass_results_list:
+                    # print("\n Results dict: ", results_dict)
+                    # if index['op_id'] not in persist_forward_pass_results_list:
+                    #     if results_dict.get('result', None) is not None:
+                    #         persisted_result = results_dict['result']
+                    # else:
+                    if index['op_id'] in persist_forward_pass_results_list:
                         if results_dict.get('result', None) is not None:
-                            del results_dict['result']
-                    else:
-                        if results_dict.get('result', None) is not None:
-                            persisted_result = results_dict['result'].to('cpu')
-                            persisted_result_path = dump_result_data(index['op_id'], persisted_result)
+                            results_dict['result'] = results_dict['result'].to('cpu')
+                            
+                    # persisted_result_path = dump_result_data(index['op_id'], persisted_result)
 
                     file_path = dump_data(index['op_id'], results_dict)
                     
-                    if persisted_result_path is not None:
-                        persisted_result_path = os.path.basename(persisted_result_path)
+                    # if persisted_result_path is not None:
+                    #     persisted_result_path = os.path.basename(persisted_result_path)
 
                     dumped_result = json.dumps({
-                        'model_file_name': os.path.basename(model_path),
                         'file_name': os.path.basename(file_path),
-                        'persisted_result_file_name': persisted_result_path,
+                        # 'persisted_result_file_name': persisted_result_path,
                         "op_id": index['op_id'],
                         "status": "success"
                     })
                     optimized_results_list.append(dumped_result) 
+                
+                elif index['operator'] == 'forward_pass' and backward_called:
+                    model_input_tensors = g.forward_computations[index['op_id']]['inputs']
+                    input_indices = g.forward_computations[index['op_id']]['input_indices']
+                    input_tensor_id = 0
+                    for op_id, index_list in input_indices.items():
+                        if len(index_list) > 0:
+                            results_dict[op_id] = {}
+                            for ind in index_list:
+                                if model_input_tensors[input_tensor_id].grad is not None:
+                                    results_dict[op_id][ind] = model_input_tensors[input_tensor_id].grad
+                                input_tensor_id += 1
+                        else:
+                            results_dict[op_id] = model_input_tensors[input_tensor_id].grad
+
+                            input_tensor_id += 1
+
+
+                    # for i in range(len(model_input_tensors)):
+                    #     if model_input_tensors[i].grad is not None:
+                    #         results_dict[input_index_list[i]] = model_input_tensors[i].grad
+
+                    file_path = dump_data(index['op_id'], results_dict, type='backward')
+
+                    dumped_result = json.dumps({
+                        'file_name': os.path.basename(file_path),
+                        "op_id": index['op_id'],
+                        "status": "success"
+                    })
+                    optimized_results_list.append(dumped_result)
+                    # print("\n Results dict with grad: ", results_dict)
+                
                 else:
+                    # print('\n Forward comp in else: ', g.forward_computations)
+                    persisted_result_path = None
+                    if isinstance(g.forward_computations[index['op_id']], dict):
+                        results_dict['result'] = g.forward_computations[index['op_id']]['result']
+                    else:
+                        results_dict['result'] = g.forward_computations[index['op_id']]
                     if 'forward_pass' in index["operator"]:
                         if index['op_id'] not in persist_forward_pass_results_list:
                             if results_dict.get('result', None) is not None:
@@ -237,8 +278,8 @@ async def subgraph_forward_process(d):
                     optimized_results_list.append(dumped_result)
 
         optimized_results_list.extend(results) 
-        results = optimized_results_list       
-        
+        results = optimized_results_list
+
         for temp_file in os.listdir(FTP_TEMP_FILES_FOLDER):
             if 'temp_' in temp_file:
                 file_path = os.path.join(FTP_TEMP_FILES_FOLDER, temp_file)
@@ -259,9 +300,10 @@ async def subgraph_forward_process(d):
                             "graph_id": d["graph_id"], 
                             "token": g.ravenverse_token,
                             "results": results}
+        print("\n Results: ", results)
         await g.client.emit("forward_subgraph_completed", json.dumps(emit_result_data), namespace="/client")
-
-        os.system('clear')
+        g.logger.debug("Forward subgraph Results Emitted")
+        # os.system('clear')
         g.dashboard_data[-1][2] = "Computed"
         print(AsciiTable([['Provider Dashboard']]).table)
         print(AsciiTable(g.dashboard_data).table)
@@ -273,30 +315,203 @@ async def subgraph_forward_process(d):
         os.remove(os.path.join(delete_dir, f))
 
     g.delete_files_list = []
-    model_key, model_k = None, None
-    for key, val in forward_computations.items():
-        if isinstance(val, torch.Tensor):
-            val.detach()
-        elif isinstance(val, dict):
-            for k, v in val.items():
-                if isinstance(v, torch.Tensor):
-                    v.detach()
-                elif isinstance(v, torch.nn.Module):
-                    model_key = key
-                    model_k = k
-                    with open('log.txt', 'a') as f:
-                        f.write("\nModel op: "+str(key) + " Key: " + str(k))
-        elif isinstance(val, torch.nn.Module):
-            with open('log.txt', 'a') as f:
-                f.write("\nModel op: "+str(key))
+    # model_key, model_k = None, None
+    # for key, val in forward_computations.items():
+    #     if isinstance(val, torch.Tensor):
+    #         val.detach()
+    #     elif isinstance(val, dict):
+    #         for k, v in val.items():
+    #             if isinstance(v, torch.Tensor):
+    #                 v.detach()
+    #             elif isinstance(v, torch.nn.Module):
+    #                 model_key = key
+    #                 model_k = k
         
-        # g.forward_computations[key] = None
+    # if model_key is not None and model_k is not None:
+    #     del forward_computations[model_key][model_k]
 
-    if model_key is not None and model_k is not None:
-        del forward_computations[model_key][model_k]
+    # forward_computations = {}
+    # print("\n Data: ", data)
+    
+    # for key in g.forward_computations.keys():
+    #     if key not in retain_keys:
+    #         del g.forward_computations[key]
 
-    forward_computations = {}
+    for key in del_keys:
+        if g.forward_computations.get(key, None) is not None:
+            del g.forward_computations[key]
 
+    # print("\n G.for comp at end: ", g.forward_computations)
+    g.logger.debug('subgraph_forward_process OVER')
+    if gpu_required:
+        torch.cuda.empty_cache()
+    gc.collect()
+    return
+
+
+async def subgraph_backward_process(d):
+    # os.system('clear')
+    print(AsciiTable([['Provider Dashboard']]).table)
+    g.dashboard_data.append([d["subgraph_id"], d["graph_id"], "Backward Computing"])
+    print(AsciiTable(g.dashboard_data).table)
+
+    g.logger.debug('subgraph_backward_process received')
+
+    # print("\n Data in backward: ", d)
+
+    g.has_subgraph = True
+    subgraph_id = d["subgraph_id"]
+    graph_id = d["graph_id"]
+    data = d["payloads"]
+    subgraph_zip_file_flag = d["subgraph_zip_file_flag"]
+    gpu_required = ast.literal_eval(d["gpu_required"])
+
+    if subgraph_zip_file_flag == "True":
+        server_file_path = 'zip_{}_{}.zip'.format(subgraph_id, graph_id)
+
+        download_path = os.path.join(FTP_DOWNLOAD_FILES_FOLDER, server_file_path)
+        filesize = d['zip_file_size']
+        try:
+            g.ftp_client.ftp.voidcmd('NOOP')
+            g.ftp_client.download(download_path, os.path.basename(server_file_path), filesize)
+
+        except Exception as error:
+            os.system('clear')
+            g.dashboard_data[-1][2] = "Failed"
+            print(AsciiTable([['Provider Dashboard']]).table)
+            print(AsciiTable(g.dashboard_data).table)
+            g.has_subgraph = False
+            
+            delete_dir = FTP_DOWNLOAD_FILES_FOLDER
+            for f in os.listdir(delete_dir):
+                os.remove(os.path.join(delete_dir, f))
+
+            g.delete_files_list = []
+
+            print('Error: ', error)
+            emit_error(data[0], error, subgraph_id, graph_id)
+            if 'broken pipe' in str(error).lower() or '421' in str(error).lower():
+                print(
+                    '\n\nYou have encountered an IO based Broken Pipe Error. \nRestart terminal and try connecting again')
+                sys.exit()
+
+        if os.path.exists(download_path):
+            extract_to_path = FTP_DOWNLOAD_FILES_FOLDER
+            with zipfile.ZipFile(download_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_to_path)
+
+            os.remove(download_path)
+            g.ftp_client.delete_file(server_file_path)
+
+    for payload in data:
+        compute_backward(payload)
+
+    results = []
+
+    for payload in data:
+        results_dict = {}
+
+        model_input_tensors = g.forward_computations[payload['op_id']]['inputs']
+        input_indices = g.forward_computations[payload['op_id']]['input_indices']
+        input_tensor_id = 0
+        for op_id, index_list in input_indices.items():
+            if len(index_list) > 0:
+                results_dict[op_id] = {}
+                for ind in index_list:
+                    if model_input_tensors[input_tensor_id].grad is not None:
+                        results_dict[op_id][ind] = model_input_tensors[input_tensor_id].grad
+                    input_tensor_id += 1
+            else:
+                results_dict[op_id] = model_input_tensors[input_tensor_id].grad
+
+                input_tensor_id += 1
+
+
+
+        # model_input_tensors = g.forward_computations[payload['op_id']]['inputs']
+        # input_index_list = g.forward_computations[payload['op_id']]['input_index_list']
+        # for i in range(len(model_input_tensors)):
+        #     if model_input_tensors[i].grad is not None:
+        #         if len(input_index_list) > 0:
+        #             results_dict['grad'][input_index_list[i]] = model_input_tensors[i].grad
+        #         else:
+        #             results_dict['grad'] = model_input_tensors[i].grad
+
+        # results_dict['optimizer'] = g.forward_computations[payload['op_id']]['optimizer']
+
+        file_path = dump_data(payload['op_id'], results_dict, type='backward')
+        # model_file_path = dump_torch_model(payload['op_id'], g.forward_computations[payload['op_id']]['instance'])
+
+        dumped_result = json.dumps({
+            'file_name': os.path.basename(file_path),
+            # 'model_path_name': os.path.basename(model_file_path),
+            "op_id": payload['op_id'],
+            "status": "success"
+        })
+
+        results.append(dumped_result)
+
+    # print('\n Final results list: ', results)
+
+    if not g.error:
+        for temp_file in os.listdir(FTP_TEMP_FILES_FOLDER):
+            if 'temp_' in temp_file:
+                file_path = os.path.join(FTP_TEMP_FILES_FOLDER, temp_file)
+
+                try:
+                    with zipfile.ZipFile('local_{}_{}.zip'.format(subgraph_id, graph_id), 'a') as zipObj2:
+                        zipObj2.write(file_path, os.path.basename(file_path))
+                except zipfile.BadZipFile as error:
+                    print(error)
+                os.remove(file_path)
+
+        zip_file_name = 'local_{}_{}.zip'.format(subgraph_id, graph_id)
+        if os.path.exists(zip_file_name):
+            g.ftp_client.upload(zip_file_name, zip_file_name)
+            os.remove(zip_file_name)
+
+        emit_result_data = {"subgraph_id": d["subgraph_id"], 
+                            "graph_id": d["graph_id"], 
+                            "token": g.ravenverse_token,
+                            "results": results}
+        await g.client.emit("backward_subgraph_completed", json.dumps(emit_result_data), namespace="/client")
+
+        # os.system('clear')
+        g.dashboard_data[-1][2] = "Backward Computed"
+        print(AsciiTable([['Provider Dashboard']]).table)
+        print(AsciiTable(g.dashboard_data).table)
+
+    g.has_subgraph = False
+    
+    delete_dir = FTP_DOWNLOAD_FILES_FOLDER
+    for f in os.listdir(delete_dir):
+        os.remove(os.path.join(delete_dir, f))
+
+    g.delete_files_list = []
+    # model_key, model_k = None, None
+    # for key, val in forward_computations.items():
+    #     if isinstance(val, torch.Tensor):
+    #         val.detach()
+    #     elif isinstance(val, dict):
+    #         for k, v in val.items():
+    #             if isinstance(v, torch.Tensor):
+    #                 v.detach()
+    #             elif isinstance(v, torch.nn.Module):
+    #                 model_key = key
+    #                 model_k = k
+        
+    # if model_key is not None and model_k is not None:
+    #     del forward_computations[model_key][model_k]
+
+    # forward_computations = {}
+    # print("\n Data: ", data)
+    
+    # for key in g.forward_computations.keys():
+    #     if key not in retain_keys:
+    #         del g.forward_computations[key]
+
+    # print("\n G.for comp at end: ", g.forward_computations)
+    g.logger.debug('subgraph_backward_process OVER')
     if gpu_required:
         torch.cuda.empty_cache()
     gc.collect()

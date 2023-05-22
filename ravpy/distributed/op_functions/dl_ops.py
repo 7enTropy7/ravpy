@@ -6,11 +6,16 @@ import time
 
 def square_loss(y, y_pred, params=None):
     device = params.get("device", "cpu")
+    op_index = params.get("op_index", 0) 
+
+    if op_index is not None:
+        y_pred = y_pred[op_index]
 
     if isinstance(y_pred, dict):
         y_pred = y_pred['result']
     if isinstance(y_pred, list) or isinstance(y_pred, np.ndarray):
         y_pred = torch.tensor(y_pred, requires_grad=True)
+
 
     y = torch.tensor(np.array(y, dtype=np.float32)).to(device=device)
     y_pred = y_pred.to(device=device)
@@ -26,11 +31,17 @@ def cross_entropy_loss(y, y_pred, params = None):
     reshape_target = params.get('reshape_target',None)
     reshape_label = params.get('reshape_label',None)
     device = params.get("device", "cpu")
+    op_index = params.get("op_index", 0)
+
+    if op_index is not None:
+        y_pred = y_pred[op_index]
 
     if isinstance(y_pred, dict):
         y_pred = y_pred['result']
     if isinstance(y_pred, list) or isinstance(y_pred, np.ndarray):
         y_pred = torch.tensor(y_pred)#, requires_grad=True)
+
+    print("\n y_pred", y_pred)
 
     y = torch.tensor(np.array(y)).to(device=device)
     # if y_pred.get_device() == -1 and device != "cpu":
@@ -718,7 +729,7 @@ def get_gpu_memory():
     # memory_free_values = [psutil.virtual_memory()[3]/1000000000]
     return memory_free_values
 
-def forward_pass(X, params=None):
+def forward_pass(*args, params=None):
     model = params.get('model', None)
     optimizer_dict = params.get('optimizer_dict', None)
     previous_batch_layer_data = params.get('previous_batch_layer_data', None)    
@@ -726,8 +737,10 @@ def forward_pass(X, params=None):
     model_jit = params.get('model_jit', None)
     training = params.get('training',True)
     device = params.get("device", "cpu")
+    retain = params.get("retain", False)
+    input_indices = params.get("input_indices", {})
 
-    essential_keys = ['model', 'optimizer_dict', 'previous_batch_layer_data', 'previous_forward_pass', 'model_jit', 'training', 'device']
+    essential_keys = ['model', 'optimizer_dict', 'previous_batch_layer_data', 'previous_forward_pass', 'model_jit', 'training', 'device', 'retain', 'input_indices']
     for key in essential_keys:
         if key in params.keys():
             del params[key]
@@ -736,12 +749,18 @@ def forward_pass(X, params=None):
         if isinstance(val, list) or isinstance(val, np.ndarray):
             params[key] = torch.tensor(val).to(device)
 
-    if isinstance(X, dict):
-        X = X['result']
-    if isinstance(X, list) or isinstance(X, np.ndarray):
-        X = torch.tensor(X)
-    # if X.get_device() == -1 and device != "cpu":
-    X = X.to(device=device)
+    input_args = []
+    for X in args:
+        if isinstance(X, dict):
+            X = X['result']
+        if isinstance(X, list) or isinstance(X, np.ndarray):
+            X = torch.tensor(X)
+        # if X.get_device() == -1 and device != "cpu":
+        X = X.to(device=device)
+        input_args.append(X)
+
+    args = input_args
+    del input_args
 
     if 'cuda' in str(device):
         torch.cuda.synchronize()
@@ -762,12 +781,17 @@ def forward_pass(X, params=None):
         if not training:
             model.eval()
         t1 = time.time()
-        result = model(X, **params)
+        result = model(*args, **params)
         t2 = time.time()
         # print("Time taken to call moodel: ", t2-t1)
         forward_pass_output = {
-            'result': result
+            'result': result,
+            'instance': model,
+            'optimizer': previous_forward_pass_instance['optimizer']
         }
+        if retain:
+            forward_pass_output['inputs'] = args
+            forward_pass_output['input_indices'] = input_indices
         return forward_pass_output
     else:
         optimizer = None
@@ -790,11 +814,19 @@ def forward_pass(X, params=None):
         if not training:
             # print("\n Eval mode set")
             model.eval()
-        result = model(X, **params)
+
+        # print("\n X and params: ", X, params)
+        result = model(*args, **params)
 
         forward_pass_output = {
             'result': result,
             'instance': model,
             'optimizer': optimizer
         }
+        if retain:
+            forward_pass_output['inputs'] = args
+            forward_pass_output['input_indices'] = input_indices
         return forward_pass_output
+    
+def model_output(*args, params=None):
+    return args
